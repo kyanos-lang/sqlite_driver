@@ -1,4 +1,8 @@
-# Treat all .kya files as Kyanos code
-*.kya linguist-language=Kyanos
-*.ll linguist-language=Kyanos
-*.kys linguist-language=Kyanos Script
+# Map Kyanos extensions to a recognized language for syntax highlighting
+*.kya linguist-language=Rust
+*.ll linguist-language=Rust
+*.kys linguist-language=Rust
+
+# Completely hide your shell build scripts so they don't override the stats
+scripts/* linguist-detectable=false
+target/* linguist-detectable=false
