@@ -1,6 +1,3 @@
-# Ignore a specific vendor folder from language statistics
-target/* linguist-vendored
-
 # Treat all .kya files as Kyanos code
 *.kya linguist-language=Kyanos
 *.ll linguist-language=Kyanos
