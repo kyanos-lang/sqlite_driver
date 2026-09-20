@@ -1,0 +1,11 @@
+[package]
+name = "sqlite"
+version = "0.1.2"
+entry = "src/lib.kya"
+kyanos = "1.0.86"
+
+[layout]
+archetype = "library"
+
+[dependencies.app]
+path = "../../kyanoslang_org/kapp"

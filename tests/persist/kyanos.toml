@@ -1,0 +1,11 @@
+[package]
+name = "sqlite_persist"
+version = "0.1.0"
+entry = "main.kya"
+kyanos = "1.0.86"
+
+[dependencies.sqlite]
+path = "../.."
+
+[dependencies.app]
+path = "../../../../kyanos_app"

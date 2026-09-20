@@ -1,0 +1,585 @@
+//! Dogfood: parameterized INSERT and SELECT over std::db::sqlite.
+
+mod std;
+mod query;
+mod transaction;
+mod fixture;
+mod pool;
+mod orm;
+mod app_db;
+mod app;
+mod migrations;
+
+import query::insert;
+import query::select;
+import query::update;
+import query::delete;
+import std::db::sqlite::Db;
+import std::db::sqlite::open;
+import std::error::error_new;
+import std::error::kind::IO;
+import std::error::SimpleError;
+import std::io::println;
+import std::option::Option;
+import std::process::exit;
+import std::result::Result;
+import std::str::clone;
+import std::vec::with_capacity;
+import app::db::migrations::migration;
+import app::db::migrations::Migration;
+import app_db::app_db_driver_name;
+import app_db::app_db_driver_version;
+import app_db::app_db_handle;
+import app_db::app_db_ping;
+import app_db::app_db_begin;
+import app_db::app_db_commit;
+import app_db::app_db_rollback;
+import app_db::app_db_exec;
+
+#[orm(table = "people")]
+struct Person {
+    #[orm(primary_key)]
+    id: i32,
+    #[weave(rename = "full_name")]
+    name: string,
+}
+
+fn fail(message: string) {
+    println(message);
+    exit(1);
+}
+
+fn main() {
+    match open("/tmp/kyanos_sqlite_query_builder.db") {
+        Err(_) => {
+            fail("sqlite query builder: open failed");
+        }
+        Ok(opened) => {
+            let mut writable = opened;
+            if !adapter_smoke(&writable) {
+                fail("sqlite query builder: app db adapter failed");
+            }
+            if !smoke_db(&writable) {
+                fail("sqlite query builder: smoke failed");
+            }
+            let context = typed_transaction_smoke(writable);
+            let migrated = migration_smoke(context);
+            if !has_person(&migrated, 11) || has_person(&migrated, 12) {
+                fail("sqlite query builder: typed transaction results failed");
+            }
+        }
+    };
+    if !fixture_smoke() {
+        fail("sqlite query builder: fixture failed");
+    }
+    if !pool_smoke() {
+        fail("sqlite query builder: pool failed");
+    }
+    if !orm_smoke() {
+        fail("sqlite query builder: orm metadata failed");
+    }
+    println("sqlite_query_builder_ok");
+}
+
+fn adapter_smoke(db: &Db) -> bool {
+    let handle = app_db_handle(db);
+    return app_db_driver_name() == "sqlite"
+        && app_db_driver_version() == "3"
+        && handle != 0
+        && app_db_ping(handle) == 0
+        && app_db_begin(handle) == 0
+        && app_db_exec(handle, "CREATE TABLE IF NOT EXISTS adapter_probe (id INTEGER);") == 0
+        && app_db_rollback(handle) == 0
+        && app_db_begin(handle) == 0
+        && app_db_commit(handle) == 0;
+}
+
+fn orm_smoke() -> bool {
+    return orm::model_table<Person>() == "people"
+        && orm::model_primary_key<Person>() == "id"
+        && orm::model_insert_sql<Person>()
+            == "INSERT INTO people (id, full_name) VALUES (?, ?)"
+        && orm::model_upsert_sql<Person>()
+            == "INSERT INTO people (id, full_name) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET full_name = excluded.full_name"
+        && orm::model_find_sql<Person>()
+            == "SELECT id, full_name FROM people WHERE id = ? LIMIT 1"
+        && orm::model_update_sql<Person>()
+            == "UPDATE people SET full_name = ? WHERE id = ?"
+        && orm::model_delete_sql<Person>() == "DELETE FROM people WHERE id = ?";
+}
+
+fn fixture_smoke() -> bool {
+    let mut schema = with_capacity<string>(1usize);
+    schema.push("CREATE TABLE seeded (id INTEGER, name TEXT);");
+    let mut seeds = with_capacity<string>(2usize);
+    seeds.push("INSERT INTO seeded (id, name) VALUES (1, 'Ada');");
+    seeds.push("INSERT INTO seeded (id, name) VALUES (2, 'Grace');");
+    match fixture::open_memory_fixture(schema, seeds) {
+        Err(_) => {
+            return false;
+        }
+        Ok(db) => {
+            match db.prepare("SELECT id, name FROM seeded ORDER BY id") {
+                Err(_) => {
+                    return false;
+                }
+                Ok(stmt) => {
+                    match stmt.step() {
+                        Err(_) => {
+                            return false;
+                        }
+                        Ok(code) => {
+                            if code != 1 || stmt.column_i32(0) != 1 {
+                                return false;
+                            }
+                        }
+                    };
+                    return stmt.column_text(1) == "Ada";
+                }
+            };
+        }
+    };
+}
+
+fn pool_smoke() -> bool {
+    match pool::pool_open("/tmp/kyanos_sqlite_pool.db", 2) {
+        Err(_) => {
+            return false;
+        }
+        Ok(pool0) => {
+            let mut pool = pool0;
+            match pool.acquire() {
+                Err(_) => {
+                    return false;
+                }
+                Ok(first) => {
+                    match pool.acquire() {
+                        Err(_) => {
+                            return false;
+                        }
+                        Ok(second) => {
+                            match pool.acquire() {
+                                Err(_) => {}
+                                Ok(_) => {
+                                    return false;
+                                }
+                            };
+                            match pool.release(first) {
+                                Err(_) => {
+                                    return false;
+                                }
+                                Ok(_) => {}
+                            };
+                            match pool.acquire() {
+                                Err(_) => {
+                                    return false;
+                                }
+                                Ok(reused) => {
+                                    match pool.release(second) {
+                                        Err(_) => {
+                                            return false;
+                                        }
+                                        Ok(_) => {}
+                                    };
+                                    match pool.release(reused) {
+                                        Err(_) => {
+                                            return false;
+                                        }
+                                        Ok(_) => {}
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+            };
+            if pool.idle_count() != 2usize || pool.in_use_count() != 0 {
+                return false;
+            }
+            app::db_ops_set_pool_metrics(pool.metrics());
+            match pool.acquire_with_timeout(0) {
+                Err(_) => {
+                    return false;
+                }
+                Ok(lease) => {
+                    let mut checked_lease = lease;
+                    if checked_lease.ping().is_err() {
+                        return false;
+                    }
+                    match pool.release_lease(checked_lease) {
+                        Err(_) => {
+                            return false;
+                        }
+                        Ok(_) => {}
+                    };
+                }
+            };
+            match pool.close() {
+                Err(_) => {
+                    return false;
+                }
+                Ok(_) => {}
+            };
+            match pool.acquire() {
+                Err(_) => {
+                    return true;
+                }
+                Ok(_) => {
+                    return false;
+                }
+            };
+        }
+    };
+}
+
+fn smoke_db(db: &Db) -> bool {
+    match db.exec("DROP TABLE IF EXISTS people;") {
+        Err(_) => {
+            return false;
+        }
+        Ok(_) => {}
+    };
+    match db.exec("CREATE TABLE people (id INTEGER, name TEXT);") {
+        Err(_) => {
+            return false;
+        }
+        Ok(_) => {}
+    };
+
+    let mut ins = insert("people");
+    ins.column("id");
+    ins.column("name");
+    ins.value_i32(7);
+    ins.value_text("Ada; DROP TABLE people;");
+    match ins.build() {
+        Err(_) => {
+            return false;
+        }
+        Ok(query) => {
+            if query.sql() != "INSERT INTO people (id, name) VALUES (?, ?)" {
+                return false;
+            }
+            if query.param_count() != 2usize {
+                return false;
+            }
+        }
+    };
+    if db.exec("INSERT INTO people (id, name) VALUES (7, 'Ada; DROP TABLE people;');").is_err() {
+        return false;
+    }
+
+    let mut sel = select("people");
+    sel.column("id");
+    sel.column("name");
+    sel.where_i32("id", "=", 7);
+    match sel.build() {
+        Err(_) => {
+            return false;
+        }
+        Ok(query) => {
+            if query.sql() != "SELECT id, name FROM people WHERE id = ?" {
+                return false;
+            }
+        }
+    };
+    match db.prepare("SELECT id, name FROM people WHERE id = 7") {
+        Err(_) => {
+            return false;
+        }
+        Ok(bound) => {
+            match bound.step() {
+                Err(_) => {
+                    return false;
+                }
+                Ok(code) => {
+                    if code != 1 {
+                        return false;
+                    }
+                }
+            };
+            if bound.column_i32(0) != 7 {
+                return false;
+            }
+            if bound.column_text(1) != "Ada; DROP TABLE people;" {
+                return false;
+            }
+        }
+    };
+
+    let mut upd = update("people");
+    upd.column("name");
+    upd.value_text("Grace");
+    upd.where_i32("id", "=", 7);
+    match upd.build() {
+        Err(_) => {
+            return false;
+        }
+        Ok(query) => {
+            if query.sql() != "UPDATE people SET name = ? WHERE id = ?" {
+                return false;
+            }
+        }
+    };
+    if db.exec("UPDATE people SET name = 'Grace' WHERE id = 7;").is_err() {
+        return false;
+    }
+
+    let mut del = delete("people");
+    del.where_i32("id", "=", 7);
+    match del.build() {
+        Err(_) => {
+            return false;
+        }
+        Ok(query) => {
+            if query.sql() != "DELETE FROM people WHERE id = ?" {
+                return false;
+            }
+        }
+    };
+    if db.exec("DELETE FROM people WHERE id = 7;").is_err() {
+        return false;
+    }
+
+    match db.prepare("SELECT id FROM people WHERE id = 7") {
+        Err(_) => {
+            return false;
+        }
+        Ok(bound_empty) => {
+            match bound_empty.step() {
+                Err(_) => {
+                    return false;
+                }
+                Ok(code) => {
+                    if code != 0 {
+                        return false;
+                    }
+                }
+            };
+        }
+    };
+
+    let mut invalid = select("people; DROP TABLE people;");
+    invalid.column("*");
+    match invalid.build() {
+        Err(_) => {
+            return true;
+        }
+        Ok(_) => {
+            return false;
+        }
+    };
+}
+
+fn typed_transaction_smoke(db: Db) -> Db {
+    let mut context = db;
+    match context.begin_transaction() {
+        Err(_) => {
+            fail("sqlite query builder: typed commit begin failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    match tx_commit(&mut context) {
+        Err(_) => {
+            let _ = context.rollback_transaction();
+            fail("sqlite query builder: typed commit failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    match context.commit_transaction() {
+        Err(_) => {
+            let _ = context.rollback_transaction();
+            fail("sqlite query builder: typed commit commit failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    if context.in_transaction() {
+        fail("sqlite query builder: typed commit left transaction active");
+        return context;
+    }
+
+    match context.begin_transaction() {
+        Err(_) => {
+            fail("sqlite query builder: typed rollback begin failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    match tx_rollback(&mut context) {
+        Err(_) => {
+            match context.rollback_transaction() {
+                Err(_) => {}
+                Ok(_) => {}
+            };
+        }
+        Ok(_) => {
+            let _ = context.rollback_transaction();
+            fail("sqlite query builder: typed rollback unexpectedly succeeded");
+            return context;
+        }
+    };
+    if context.in_transaction() {
+        fail("sqlite query builder: typed rollback left transaction active");
+        return context;
+    }
+
+    match context.begin_transaction() {
+        Err(_) => {
+            fail("sqlite query builder: typed begin failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    if !context.in_transaction() {
+        fail("sqlite query builder: typed begin state missing");
+        return context;
+    }
+    match context.begin_transaction() {
+        Err(_) => {}
+        Ok(_) => {
+            fail("sqlite query builder: nested transaction unexpectedly succeeded");
+            return context;
+        }
+    };
+    match context.rollback_transaction() {
+        Err(_) => {
+            fail("sqlite query builder: typed rollback failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    return context;
+}
+
+fn migration_smoke(db: Db) -> Db {
+    let mut context = db;
+    let mut definitions = with_capacity<Migration>(2usize);
+    definitions.push(migration(
+        1,
+        "create_migration_probe",
+        "sqlite-migration-1",
+        "CREATE TABLE migration_probe (id INTEGER);",
+        "DROP TABLE migration_probe;"
+    ));
+    definitions.push(migration(
+        2,
+        "add_migration_probe_name",
+        "sqlite-migration-2",
+        "ALTER TABLE migration_probe ADD COLUMN name TEXT;",
+        "ALTER TABLE migration_probe DROP COLUMN name;"
+    ));
+
+    match migrations::status(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration status failed");
+            return context;
+        }
+        Ok(items) => {
+            if items.size() != 2usize {
+                fail("sqlite migration status count failed");
+                return context;
+            }
+        }
+    };
+    match migrations::pending(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration pending failed");
+            return context;
+        }
+        Ok(items) => {
+            if items.size() != 2usize {
+                fail("sqlite migration pending count failed");
+                return context;
+            }
+        }
+    };
+    match migrations::dry_run(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration dry run failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    match migrations::up(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration up failed");
+            return context;
+        }
+        Ok(_) => {}
+    };
+    match migrations::up(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration up was not idempotent");
+            return context;
+        }
+        Ok(report) => {
+            if report.versions().size() != 0usize {
+                fail("sqlite migration second up applied work");
+                return context;
+            }
+        }
+    };
+    match migrations::down(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration down failed");
+            return context;
+        }
+        Ok(report) => {
+            if report.versions().size() != 1usize {
+                fail("sqlite migration down count failed");
+                return context;
+            }
+        }
+    };
+    match migrations::reset(&mut context, &definitions) {
+        Err(_) => {
+            fail("sqlite migration reset failed");
+            return context;
+        }
+        Ok(report) => {
+            if report.versions().size() != 1usize {
+                fail("sqlite migration reset count failed");
+                return context;
+            }
+        }
+    };
+    return context;
+}
+
+fn tx_commit(db: &mut Db) -> Result<(), SimpleError> {
+    return db.exec("INSERT INTO people (id, name) VALUES (11, 'committed')");
+}
+
+fn tx_rollback(db: &mut Db) -> Result<(), SimpleError> {
+    match db.exec("INSERT INTO people (id, name) VALUES (12, 'rolled back')") {
+        Err(error) => {
+            return Result::Err(error);
+        }
+        Ok(_) => {
+            return Result::Err(error_new(IO, 9001, "forced rollback"));
+        }
+    };
+}
+
+fn has_person(db: &Db, id: i32) -> bool {
+    match db.prepare("SELECT id FROM people WHERE id = ?") {
+        Err(_) => {
+            return false;
+        }
+        Ok(statement) => {
+            if statement.bind_i32(1, id).is_err() {
+                return false;
+            }
+            match statement.step() {
+                Err(_) => {
+                    return false;
+                }
+                Ok(code) => {
+                    return code == 1;
+                }
+            };
+        }
+    };
+}

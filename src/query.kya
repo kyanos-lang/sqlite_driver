@@ -1,0 +1,436 @@
+//! Parameterized SQLite query builder.
+
+mod std;
+
+import std::db::sqlite::Db;
+import std::db::sqlite::Stmt;
+import std::convert::i32_to_string;
+import std::error::SimpleError;
+import std::error::error_from_code;
+import std::error::kind::OTHER;
+import std::option::Option;
+import std::result::Result;
+import std::str::clone;
+import std::vec::Vec;
+import std::vec::with_capacity;
+
+const ERR_INVALID_IDENTIFIER: i32 = 1001;
+const ERR_INVALID_OPERATOR: i32 = 1002;
+const ERR_EMPTY_COLUMNS: i32 = 1003;
+const ERR_MISSING_VALUES: i32 = 1004;
+const ERR_UNSAFE_MUTATION: i32 = 1005;
+const ERR_INVALID_LIMIT: i32 = 1006;
+
+const KIND_SELECT: i32 = 1;
+const KIND_INSERT: i32 = 2;
+const KIND_UPDATE: i32 = 3;
+const KIND_DELETE: i32 = 4;
+
+const VALUE_I32: i32 = 1;
+const VALUE_TEXT: i32 = 2;
+const VALUE_BLOB: i32 = 3;
+
+/// Values are always bound parameters; they are never interpolated into SQL.
+pub struct Value {
+    kind: i32,
+    i32_value: i32,
+    text_value: string,
+}
+
+fn value_i32_param(value: i32) -> Value {
+    return Value {
+        kind: VALUE_I32,
+        i32_value: value,
+        text_value: "",
+    };
+}
+
+fn value_text_param(value: string) -> Value {
+    return Value {
+        kind: VALUE_TEXT,
+        i32_value: 0,
+        text_value: value,
+    };
+}
+
+fn value_blob_param(value: Vec<u8>) -> Value {
+    return Value {
+        kind: VALUE_BLOB,
+        i32_value: value.size() as i32,
+        text_value: "",
+    };
+}
+
+struct Predicate {
+    column: string,
+    op: string,
+    value: Value,
+}
+
+/// A query with SQL text and ordered bind values.
+pub struct Query {
+    sql_text: string,
+    params: Vec<Value>,
+}
+
+/// A reusable builder for one SQL statement.
+pub struct QueryBuilder {
+    kind: i32,
+    table: string,
+    columns: Vec<string>,
+    values: Vec<Value>,
+    predicates: Vec<Predicate>,
+    order_column: string,
+    descending: bool,
+    limit_value: i32,
+}
+
+/// A prepared statement retaining its bound values for the statement lifetime.
+pub struct BoundQuery {
+    stmt: Stmt,
+    params: Vec<Value>,
+}
+
+fn query_error(code: i32) -> SimpleError {
+    return error_from_code(OTHER, code);
+}
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 65u8 && c <= 90u8) || (c >= 97u8 && c <= 122u8) || c == 95u8;
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48u8 && c <= 57u8;
+}
+
+fn valid_identifier(name: &str) -> bool {
+    let n = len(name);
+    if n == 0 || !is_alpha(name[0]) {
+        return false;
+    }
+    let mut i: usize = 1;
+    while i < n {
+        if !is_alpha(name[i]) && !is_digit(name[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn valid_column(name: &str, allow_star: bool) -> bool {
+    if allow_star && name == "*" {
+        return true;
+    }
+    return valid_identifier(name);
+}
+
+fn valid_operator(op: &str) -> bool {
+    return op == "="
+        || op == "!="
+        || op == "<>"
+        || op == "<"
+        || op == "<="
+        || op == ">"
+        || op == ">=";
+}
+
+fn columns_sql(columns: &mut Vec<string>, allow_star: bool) -> Result<string, SimpleError> {
+    if columns.is_empty() {
+        return Result::Err(query_error(ERR_EMPTY_COLUMNS));
+    }
+    let mut out = "";
+    while !columns.is_empty() {
+        let column = columns.remove(0);
+        if !valid_column(column.as_str(), allow_star) {
+            return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+        }
+        if allow_star && column == "*" && (!columns.is_empty() || out != "") {
+            return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+        }
+        if out != "" {
+            out = out + ", ";
+        }
+        out = out + column;
+    }
+    return Result::Ok(out);
+}
+
+fn append_predicates(
+    predicates: &mut Vec<Predicate>,
+    sql: string,
+    params: &mut Vec<Value>,
+) -> Result<string, SimpleError> {
+    let mut out = sql;
+    let mut first = true;
+    while !predicates.is_empty() {
+        let predicate = predicates.remove(0);
+        if !valid_identifier(predicate.column.as_str()) {
+            return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+        }
+        if !valid_operator(predicate.op.as_str()) {
+            return Result::Err(query_error(ERR_INVALID_OPERATOR));
+        }
+        if first {
+            out = out + " WHERE ";
+            first = false;
+        } else {
+            out = out + " AND ";
+        }
+        out = out + predicate.column + " " + predicate.op + " ?";
+        params.push(predicate.value);
+    }
+    return Result::Ok(out);
+}
+
+fn new_builder(kind: i32, table: string) -> QueryBuilder {
+    return QueryBuilder {
+        kind: kind,
+        table: table,
+        columns: with_capacity<string>(4),
+        values: with_capacity<Value>(4),
+        predicates: with_capacity<Predicate>(4),
+        order_column: "",
+        descending: false,
+        limit_value: 0,
+    };
+}
+
+/// Start a SELECT query. Add columns with `column`, then call `build`.
+pub fn select(table: &str) -> QueryBuilder {
+    return new_builder(KIND_SELECT, clone(table));
+}
+
+/// Start an INSERT query. Add columns and values, then call `build`.
+pub fn insert(table: &str) -> QueryBuilder {
+    return new_builder(KIND_INSERT, clone(table));
+}
+
+/// Start an UPDATE query. Add assignments and predicates, then call `build`.
+pub fn update(table: &str) -> QueryBuilder {
+    return new_builder(KIND_UPDATE, clone(table));
+}
+
+/// Start a DELETE query. Add at least one predicate, then call `build`.
+pub fn delete(table: &str) -> QueryBuilder {
+    return new_builder(KIND_DELETE, clone(table));
+}
+
+impl QueryBuilder {
+    /// Add a selected, inserted, or updated column.
+    pub fn column(&mut self, name: &str) {
+        self.columns.push(clone(name));
+    }
+
+    /// Add an i32 INSERT value or UPDATE assignment.
+    pub fn value_i32(&mut self, value: i32) {
+        self.values.push(value_i32_param(value));
+    }
+
+    /// Add a text INSERT value or UPDATE assignment.
+    pub fn value_text(&mut self, value: string) {
+        self.values.push(value_text_param(value));
+    }
+
+    /// Add a blob INSERT value or UPDATE assignment.
+    pub fn value_blob(&mut self, value: Vec<u8>) {
+        self.values.push(value_blob_param(value));
+    }
+
+    /// Add an i32 equality or comparison predicate.
+    pub fn where_i32(&mut self, column: &str, op: &str, value: i32) {
+        self.predicates.push(Predicate {
+            column: clone(column),
+            op: clone(op),
+            value: value_i32_param(value),
+        });
+    }
+
+    /// Add a text equality or comparison predicate.
+    pub fn where_text(&mut self, column: &str, op: &str, value: string) {
+        self.predicates.push(Predicate {
+            column: clone(column),
+            op: clone(op),
+            value: value_text_param(value),
+        });
+    }
+
+    /// Add a blob equality predicate.
+    pub fn where_blob(&mut self, column: &str, op: &str, value: Vec<u8>) {
+        self.predicates.push(Predicate {
+            column: clone(column),
+            op: clone(op),
+            value: value_blob_param(value),
+        });
+    }
+
+    /// Add a validated ordering column.
+    pub fn order_by(&mut self, column: &str, descending: bool) {
+        self.order_column = clone(column);
+        self.descending = descending;
+    }
+
+    /// Add a positive row limit.
+    pub fn limit(&mut self, value: i32) {
+        self.limit_value = value;
+    }
+
+    /// Render the statement and transfer its values into a reusable Query.
+    pub fn build(self) -> Result<Query, SimpleError> {
+        let table = self.table;
+        if !valid_identifier(table.as_str()) {
+            return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+        }
+        if self.limit_value < 0 {
+            return Result::Err(query_error(ERR_INVALID_LIMIT));
+        }
+        if self.kind != KIND_SELECT
+            && (self.order_column != "" || self.limit_value > 0)
+        {
+            return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+        }
+
+        let mut params = with_capacity<Value>(self.values.size() + self.predicates.size());
+        let mut sql = "";
+        let mut columns = self.columns;
+        let mut values = self.values;
+        let mut predicates = self.predicates;
+
+        if self.kind == KIND_SELECT {
+            let selected = columns_sql(&mut columns, true)?;
+            sql = "SELECT " + selected + " FROM " + clone(table.as_str());
+        } else if self.kind == KIND_INSERT {
+            if columns.is_empty()
+                || columns.size() != values.size()
+                || !predicates.is_empty()
+            {
+                return Result::Err(query_error(ERR_MISSING_VALUES));
+            }
+            let names = columns_sql(&mut columns, false)?;
+            sql = "INSERT INTO " + clone(table.as_str()) + " (" + names + ") VALUES (";
+            let mut first = true;
+            while !values.is_empty() {
+                let value = values.remove(0);
+                if !first {
+                    sql = sql + ", ";
+                }
+                first = false;
+                sql = sql + "?";
+                params.push(value);
+            }
+            sql = sql + ")";
+        } else if self.kind == KIND_UPDATE {
+            if columns.is_empty() || columns.size() != values.size() {
+                return Result::Err(query_error(ERR_MISSING_VALUES));
+            }
+            sql = "UPDATE " + clone(table.as_str()) + " SET ";
+            let mut first_set = true;
+            while !columns.is_empty() {
+                let column = columns.remove(0);
+                if !valid_identifier(column.as_str()) {
+                    return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+                }
+                if !first_set {
+                    sql = sql + ", ";
+                }
+                first_set = false;
+                sql = sql + column + " = ?";
+                params.push(values.remove(0));
+            }
+            if predicates.is_empty() {
+                return Result::Err(query_error(ERR_UNSAFE_MUTATION));
+            }
+        } else {
+            if self.kind != KIND_DELETE || predicates.is_empty() {
+                return Result::Err(query_error(ERR_UNSAFE_MUTATION));
+            }
+            sql = "DELETE FROM " + clone(table.as_str());
+        }
+
+        sql = append_predicates(&mut predicates, sql, &mut params)?;
+        if self.kind == KIND_SELECT && self.order_column != "" {
+            if !valid_identifier(self.order_column.as_str()) {
+                return Result::Err(query_error(ERR_INVALID_IDENTIFIER));
+            }
+            sql = sql + " ORDER BY " + self.order_column;
+            if self.descending {
+                sql = sql + " DESC";
+            } else {
+                sql = sql + " ASC";
+            }
+        }
+        if self.limit_value > 0 {
+            sql = sql + " LIMIT " + i32_to_string(self.limit_value);
+        }
+        return Result::Ok(Query {
+            sql_text: sql,
+            params: params,
+        });
+    }
+}
+
+fn bind_value(stmt: &Stmt, index: i32, value: &Value) -> Result<(), SimpleError> {
+    if value.kind == VALUE_I32 {
+        return stmt.bind_i32(index, value.i32_value);
+    }
+    if value.kind == VALUE_TEXT {
+        return stmt.bind_text(index, clone(value.text_value.as_str()));
+    }
+    return Result::Err(query_error(ERR_MISSING_VALUES));
+}
+
+impl Query {
+    /// Return a copy of the rendered SQL text.
+    pub fn sql(&self) -> string {
+        return clone(self.sql_text.as_str());
+    }
+
+    /// Number of ordered parameters.
+    pub fn param_count(&self) -> usize {
+        return self.params.size();
+    }
+
+    /// Prepare and bind while retaining blob storage for SQLite's static bind ABI.
+    pub fn prepare(self, db: &Db) -> Result<BoundQuery, SimpleError> {
+        let stmt = db.prepare(self.sql_text)?;
+        let params = self.params;
+        let mut i: usize = 0;
+        while i < params.size() {
+            bind_value(&stmt, (i + 1) as i32, params.get(i))?;
+            i = i + 1;
+        }
+        return Result::Ok(BoundQuery {
+            stmt: stmt,
+            params: params,
+        });
+    }
+
+    /// Execute one-step statements and return SQLite's step code.
+    pub fn execute(self, db: &Db) -> Result<i32, SimpleError> {
+        let bound = self.prepare(db)?;
+        return bound.step();
+    }
+}
+
+impl BoundQuery {
+    /// Step the statement: 1 means a row, 0 means done.
+    pub fn step(&self) -> Result<i32, SimpleError> {
+        return self.stmt.step();
+    }
+
+    pub fn reset(&self) -> Result<(), SimpleError> {
+        return self.stmt.reset();
+    }
+
+    pub fn column_i32(&self, column: i32) -> i32 {
+        return self.stmt.column_i32(column);
+    }
+
+    pub fn column_text(&self, column: i32) -> string {
+        return self.stmt.column_text(column);
+    }
+
+    pub fn column_blob(&self, column: i32) -> Option<Vec<u8>> {
+        return self.stmt.column_blob(column);
+    }
+}

@@ -1,0 +1,493 @@
+//! Public SQLite query-builder package.
+
+mod std;
+mod query;
+mod transaction;
+mod fixture;
+mod pool;
+mod orm;
+mod app_db;
+mod app;
+mod migrations;
+
+import query::BoundQuery;
+import query::Query;
+import query::QueryBuilder;
+import query::select as select_impl;
+import query::insert as insert_impl;
+import query::update as update_impl;
+import query::delete as delete_impl;
+import fixture::apply;
+import fixture::reset as fixture_reset_impl;
+import fixture::open_fixture;
+import fixture::open_memory_fixture;
+import pool::SqlitePool;
+import pool::DbLease;
+import pool::pool_open;
+import std::db::sqlite::Db;
+import std::db::sqlite::Stmt;
+import std::error::SimpleError;
+import std::option::Option;
+import std::result::Result;
+import std::str::clone;
+import std::vec::Vec;
+import std::vec::with_capacity;
+import app::db::migrations::Migration;
+import app::db::migrations::MigrationStatus;
+import app::db::migrations::MigrationReport;
+import app::db::seeder::SeedOptions;
+import app::db::seeder::SeedReport;
+import app::db::seeder::seed_report;
+import app::db::seeder::CONFLICT_IGNORE;
+import app::db::seeder::CONFLICT_UPDATE;
+import migrations::status as migration_status_impl;
+import migrations::pending as migration_pending_impl;
+import migrations::dry_run as migration_dry_run_impl;
+import migrations::up as migration_up_impl;
+import migrations::down as migration_down_impl;
+import migrations::reset as migration_reset_impl;
+import transaction::with_transaction as with_transaction_impl;
+import app_db::app_db_driver_name;
+import app_db::app_db_driver_version;
+import app_db::app_db_handle;
+import app_db::app_db_take_handle;
+import app_db::app_db_ping;
+import app_db::app_db_begin;
+import app_db::app_db_commit;
+import app_db::app_db_rollback;
+import app_db::app_db_close;
+import app_db::app_db_exec;
+
+pub fn with_transaction<T>(
+    db: &mut Db,
+    body: fn(&mut Db) -> Result<T, SimpleError>
+) -> Result<T, SimpleError> {
+    return with_transaction_impl(db, body);
+}
+
+pub fn fixture_apply(db: &Db, statements: &Vec<string>) -> Result<(), SimpleError> {
+    return apply(db, statements);
+}
+
+pub fn fixture_reset(db: &Db, statements: &Vec<string>) -> Result<(), SimpleError> {
+    return fixture_reset_impl(db, statements);
+}
+
+pub fn fixture_open(
+    path: string,
+    schema: Vec<string>,
+    seeds: Vec<string>
+) -> Result<Db, SimpleError> {
+    return open_fixture(path, schema, seeds);
+}
+
+pub fn fixture_open_memory(
+    schema: Vec<string>,
+    seeds: Vec<string>
+) -> Result<Db, SimpleError> {
+    return open_memory_fixture(schema, seeds);
+}
+
+pub fn open_pool(path: string, max: i32) -> Result<SqlitePool, SimpleError> {
+    return pool_open(path, max);
+}
+
+pub fn open(path: string) -> Result<Db, SimpleError> {
+    return std::db::sqlite::open(path);
+}
+
+/// Open a caller-owned typed SQLite context.
+pub fn open_context(path: string) -> Result<Db, SimpleError> {
+    return std::db::sqlite::open(path);
+}
+
+/// Callback metadata for explicit wiring into `app::db_backend`.
+pub fn db_driver_name() -> string {
+    return app_db_driver_name();
+}
+
+pub fn db_driver_version() -> string {
+    return app_db_driver_version();
+}
+
+pub fn db_handle(db: &Db) -> i32 {
+    return app_db_handle(db);
+}
+
+/// Transfer the SQLite handle to `app::db`; `db` must not be used afterward.
+pub fn db_take_handle(db: &mut Db) -> i32 {
+    return app_db_take_handle(db);
+}
+
+pub fn db_ping(handle: i32) -> i32 {
+    return app_db_ping(handle);
+}
+
+pub fn db_begin(handle: i32) -> i32 {
+    return app_db_begin(handle);
+}
+
+pub fn db_commit(handle: i32) -> i32 {
+    return app_db_commit(handle);
+}
+
+pub fn db_rollback(handle: i32) -> i32 {
+    return app_db_rollback(handle);
+}
+
+pub fn db_close(handle: i32) -> i32 {
+    return app_db_close(handle);
+}
+
+pub fn db_exec(handle: i32, sql: string) -> i32 {
+    return app_db_exec(handle, sql);
+}
+
+pub fn migration_status(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<Vec<MigrationStatus>, SimpleError> {
+    return migration_status_impl(db, migrations);
+}
+
+pub fn migration_pending(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<Vec<MigrationStatus>, SimpleError> {
+    return migration_pending_impl(db, migrations);
+}
+
+pub fn migration_dry_run(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    return migration_dry_run_impl(db, migrations);
+}
+
+pub fn migration_up(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    return migration_up_impl(db, migrations);
+}
+
+pub fn migration_down(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    return migration_down_impl(db, migrations);
+}
+
+pub fn migration_reset(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    return migration_reset_impl(db, migrations);
+}
+
+pub fn model_table<T>() -> string {
+    return orm::model_table<T>();
+}
+
+pub fn model_primary_key<T>() -> string {
+    return orm::model_primary_key<T>();
+}
+
+pub fn model_insert_sql<T>() -> string {
+    return orm::model_insert_sql<T>();
+}
+
+pub fn model_upsert_sql<T>() -> string {
+    return orm::model_upsert_sql<T>();
+}
+
+pub fn model_ignore_sql<T>() -> string {
+    return orm::model_ignore_sql<T>();
+}
+
+pub fn model_find_sql<T>() -> string {
+    return orm::model_find_sql<T>();
+}
+
+pub fn model_update_sql<T>() -> string {
+    return orm::model_update_sql<T>();
+}
+
+pub fn model_delete_sql<T>() -> string {
+    return orm::model_delete_sql<T>();
+}
+
+/// Ordered bind payload for persist verbs (no function-pointer references).
+pub struct BindValues {
+    kinds: Vec<i32>,
+    i32s: Vec<i32>,
+    texts: Vec<string>,
+}
+
+pub fn bind_values() -> BindValues {
+    return BindValues {
+        kinds: with_capacity<i32>(4usize),
+        i32s: with_capacity<i32>(4usize),
+        texts: with_capacity<string>(4usize),
+    };
+}
+
+impl BindValues {
+    pub fn push_i32(&mut self, value: i32) {
+        self.kinds.push(1);
+        self.i32s.push(value);
+        self.texts.push("");
+    }
+
+    pub fn push_text(&mut self, value: string) {
+        self.kinds.push(2);
+        self.i32s.push(0);
+        self.texts.push(value);
+    }
+}
+
+/// Copied column values for persist readers.
+pub struct RowValues {
+    i32s: Vec<i32>,
+    texts: Vec<string>,
+}
+
+impl RowValues {
+    pub fn column_i32(&self, col: i32) -> i32 {
+        return *self.i32s.get(col as usize);
+    }
+
+    pub fn column_text(&self, col: i32) -> string {
+        return clone(self.texts.get(col as usize).as_str());
+    }
+}
+
+fn apply_binds(statement: &Stmt, values: &BindValues) -> Result<(), SimpleError> {
+    let mut i: usize = 0usize;
+    while i < values.kinds.size() {
+        let kind = *values.kinds.get(i);
+        let idx = (i as i32) + 1;
+        if kind == 1 {
+            statement.bind_i32(idx, *values.i32s.get(i))?;
+        } else {
+            statement.bind_text(idx, clone(values.texts.get(i).as_str()))?;
+        }
+        i = i + 1usize;
+    }
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+fn row_values_from_stmt(statement: &Stmt) -> RowValues {
+    let mut i32s = with_capacity<i32>(2usize);
+    let mut texts = with_capacity<string>(2usize);
+    i32s.push(statement.column_i32(0));
+    i32s.push(statement.column_i32(1));
+    texts.push(statement.column_text(0));
+    texts.push(statement.column_text(1));
+    return RowValues {
+        i32s: i32s,
+        texts: texts,
+    };
+}
+
+/// Driver-local statement wrapper used by seed_models.
+pub struct PersistStmt {
+    stmt: Stmt,
+}
+
+impl PersistStmt {
+    pub fn bind_i32(&self, index: i32, value: i32) -> Result<(), SimpleError> {
+        return self.stmt.bind_i32(index, value);
+    }
+
+    pub fn bind_text(&self, index: i32, value: string) -> Result<(), SimpleError> {
+        return self.stmt.bind_text(index, value);
+    }
+
+    pub fn column_i32(&self, col: i32) -> i32 {
+        return self.stmt.column_i32(col);
+    }
+
+    pub fn column_text(&self, col: i32) -> string {
+        return self.stmt.column_text(col);
+    }
+}
+
+fn execute_seed_model<T>(
+    db: &mut Db,
+    sql: string,
+    model: &T,
+    binder: fn(&PersistStmt, &T) -> Result<(), SimpleError>
+) -> Result<(), SimpleError> {
+    let statement = db.prepare(sql)?;
+    let bound = PersistStmt { stmt: statement };
+    binder(&bound, model)?;
+    bound.stmt.step()?;
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+/// Seed typed models in transactional batches using generated model SQL.
+pub fn seed_models<T>(
+    db: &mut Db,
+    models: Vec<T>,
+    opts: &SeedOptions,
+    binder: fn(&PersistStmt, &T) -> Result<(), SimpleError>
+) -> Result<SeedReport, SimpleError> {
+    let policy = opts.conflict_policy();
+    let sql = if policy == CONFLICT_UPDATE {
+        orm::model_upsert_sql<T>()
+    } else if policy == CONFLICT_IGNORE {
+        orm::model_ignore_sql<T>()
+    } else {
+        orm::model_insert_sql<T>()
+    };
+    let mut report = seed_report("sqlite-model", opts.dry_run());
+    let mut open = false;
+    let mut batch: i32 = 0;
+    let mut i: usize = 0usize;
+    while i < models.size() {
+        report.record_read();
+        if !opts.dry_run() {
+            if !open {
+                db.begin_transaction()?;
+                open = true;
+                batch = 0;
+            }
+            let model = models.get(i);
+            match execute_seed_model(db, clone(sql.as_str()), model, binder) {
+                Err(error) => {
+                    let _ = db.rollback_transaction();
+                    return Result::Err(error);
+                }
+                Ok(_) => {}
+            };
+            if policy == CONFLICT_UPDATE {
+                report.record_updated();
+            } else if policy == CONFLICT_IGNORE {
+                report.record_skipped();
+            } else {
+                report.record_inserted();
+            }
+            batch = batch + 1;
+            if batch >= opts.batch_size() {
+                match db.commit_transaction() {
+                    Err(error) => {
+                        let _ = db.rollback_transaction();
+                        return Result::Err(error);
+                    }
+                    Ok(_) => {
+                        report.record_batch();
+                        opts.notify_progress(report.read(), report.batches());
+                        open = false;
+                    }
+                };
+            }
+        }
+        i = i + 1usize;
+    }
+    if open {
+        match db.commit_transaction() {
+            Err(error) => {
+                let _ = db.rollback_transaction();
+                return Result::Err(error);
+            }
+            Ok(_) => {
+                report.record_batch();
+                opts.notify_progress(report.read(), report.batches());
+                open = false;
+            }
+        };
+    }
+    return Result::Ok(report);
+}
+
+fn execute_bound(db: &Db, sql: string, values: BindValues) -> Result<(), SimpleError> {
+    let statement = db.prepare(sql)?;
+    apply_binds(&statement, &values)?;
+    statement.step()?;
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+/// Execute the compile-time generated parameterized insert for `T`.
+pub fn model_insert<T>(db: &Db, values: BindValues) -> Result<(), SimpleError> {
+    return execute_bound(db, orm::model_insert_sql<T>(), values);
+}
+
+/// Execute the compile-time generated parameterized upsert for `T`.
+pub fn model_upsert<T>(db: &Db, values: BindValues) -> Result<(), SimpleError> {
+    return execute_bound(db, orm::model_upsert_sql<T>(), values);
+}
+
+/// Execute the compile-time generated parameterized update for `T`.
+pub fn model_update<T>(db: &Db, values: BindValues) -> Result<(), SimpleError> {
+    return execute_bound(db, orm::model_update_sql<T>(), values);
+}
+
+/// Find one model by primary key. The caller reads `RowValues`.
+pub fn model_find<T>(db: &Db, id: i32) -> Result<Option<RowValues>, SimpleError> {
+    let statement = db.prepare(orm::model_find_sql<T>())?;
+    statement.bind_i32(1, id)?;
+    let code = statement.step()?;
+    if code != 1 {
+        let none: Option<RowValues> = Option::None();
+        return Result::Ok(none);
+    }
+    let some: Option<RowValues> = Option::Some(row_values_from_stmt(&statement));
+    return Result::Ok(some);
+}
+
+/// Delete one model by primary key.
+pub fn model_delete<T>(db: &Db, id: i32) -> Result<(), SimpleError> {
+    let statement = db.prepare(orm::model_delete_sql<T>())?;
+    statement.bind_i32(1, id)?;
+    statement.step()?;
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+pub fn select(table: &str) -> QueryBuilder {
+    return select_impl(table);
+}
+
+pub fn insert(table: &str) -> QueryBuilder {
+    return insert_impl(table);
+}
+
+pub fn update(table: &str) -> QueryBuilder {
+    return update_impl(table);
+}
+
+pub fn delete(table: &str) -> QueryBuilder {
+    return delete_impl(table);
+}
+
+pub fn query_sql(query: Query) -> string {
+    return query.sql();
+}
+
+pub fn query_prepare(query: Query, db: &Db) -> Result<BoundQuery, SimpleError> {
+    return query.prepare(db);
+}
+
+pub fn query_execute(query: Query, db: &Db) -> Result<i32, SimpleError> {
+    return query.execute(db);
+}
+
+pub fn bound_step(query: &BoundQuery) -> Result<i32, SimpleError> {
+    return query.step();
+}
+
+pub fn bound_column_i32(query: &BoundQuery, column: i32) -> i32 {
+    return query.column_i32(column);
+}
+
+pub fn bound_column_text(query: &BoundQuery, column: i32) -> string {
+    return query.column_text(column);
+}
+
+pub fn bound_column_blob(query: &BoundQuery, column: i32) -> Option<Vec<u8>> {
+    return query.column_blob(column);
+}

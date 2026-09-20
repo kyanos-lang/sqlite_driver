@@ -1,0 +1,369 @@
+//! Durable embedded migrations for SQLite.
+
+mod std;
+
+import app::db::migrations::AppliedMigration;
+import app::db::migrations::HISTORY_DRIFT;
+import app::db::migrations::HISTORY_MISSING;
+import app::db::migrations::Migration;
+import app::db::migrations::MigrationReport;
+import app::db::migrations::MigrationStatus;
+import app::db::migrations::applied_migration;
+import app::db::migrations::find_applied;
+import app::db::migrations::find_migration;
+import app::db::migrations::history_check;
+import app::db::migrations::last_version;
+import app::db::migrations::report as migration_report;
+import app::db::migrations::status as migration_status;
+import app::db::migrations::validate;
+import std::db::sqlite::Db;
+import std::error::SimpleError;
+import std::error::error_new;
+import std::error::kind::OTHER;
+import std::result::Result;
+import std::str::clone;
+import std::vec::Vec;
+import std::vec::with_capacity;
+
+pub const ERR_INVALID: i32 = 2101;
+pub const ERR_DRIFT: i32 = 2102;
+pub const ERR_MISSING: i32 = 2103;
+pub const ERR_EMPTY: i32 = 2104;
+
+fn migration_error(code: i32, message: string) -> SimpleError {
+    return error_new(OTHER, code, message);
+}
+
+fn validate_definitions(migrations: &Vec<Migration>) -> Result<(), SimpleError> {
+    match validate(migrations) {
+        Err(_) => {
+            return Result::Err(migration_error(
+                ERR_INVALID,
+                "invalid embedded migration definitions"
+            ));
+        }
+        Ok(_) => {
+            let ok: Result<(), SimpleError> = Result::Ok(());
+            return ok;
+        }
+    };
+}
+
+fn create_history(db: &mut Db) -> Result<(), SimpleError> {
+    return db.exec(
+        "CREATE TABLE IF NOT EXISTS kyanos_schema_migrations " +
+        "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, " +
+        "checksum TEXT NOT NULL, applied_order INTEGER NOT NULL)"
+    );
+}
+
+fn load_history(db: &mut Db) -> Vec<AppliedMigration> {
+    let mut out = with_capacity<AppliedMigration>(0);
+    match db.prepare(
+        "SELECT version, name, checksum FROM kyanos_schema_migrations ORDER BY version"
+    ) {
+        Err(_) => {
+            return out;
+        }
+        Ok(statement) => {
+            let mut done = false;
+            while !done {
+                match statement.step() {
+                    Err(_) => {
+                        done = true;
+                    }
+                    Ok(code) => {
+                        if code == 0 {
+                            done = true;
+                        } else {
+                            out.push(applied_migration(
+                                statement.column_i32(0),
+                                statement.column_text(1),
+                                statement.column_text(2)
+                            ));
+                        }
+                    }
+                };
+            }
+        }
+    };
+    return out;
+}
+
+fn verify_history(
+    migrations: &Vec<Migration>,
+    applied: &Vec<AppliedMigration>
+) -> Result<(), SimpleError> {
+    let code = history_check(migrations, applied);
+    if code == HISTORY_MISSING {
+        return Result::Err(migration_error(
+            ERR_MISSING,
+            "applied migration is missing from embedded definitions"
+        ));
+    }
+    if code == HISTORY_DRIFT {
+        return Result::Err(migration_error(
+            ERR_DRIFT,
+            "applied migration checksum or name differs"
+        ));
+    }
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+fn record_applied(
+    db: &mut Db,
+    migration: &Migration,
+    order: i32
+) -> Result<(), SimpleError> {
+    let statement = db.prepare(
+        "INSERT INTO kyanos_schema_migrations " +
+        "(version, name, checksum, applied_order) VALUES (?, ?, ?, ?)"
+    )?;
+    statement.bind_i32(1, migration.version())?;
+    statement.bind_text(2, migration.name())?;
+    statement.bind_text(3, migration.checksum())?;
+    statement.bind_i32(4, order)?;
+    statement.step()?;
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+fn delete_applied(db: &mut Db, version: i32) -> Result<(), SimpleError> {
+    let statement = db.prepare("DELETE FROM kyanos_schema_migrations WHERE version = ?")?;
+    statement.bind_i32(1, version)?;
+    statement.step()?;
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+fn rollback(db: &mut Db) {
+    match db.rollback_transaction() {
+        Err(_) => {}
+        Ok(_) => {}
+    };
+}
+
+fn finish_commit(
+    db: &mut Db,
+    report: MigrationReport
+) -> Result<MigrationReport, SimpleError> {
+    match db.commit_transaction() {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {
+            return Result::Ok(report);
+        }
+    };
+}
+
+/// Report the state of all embedded migrations without creating tables.
+pub fn status(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<Vec<MigrationStatus>, SimpleError> {
+    validate_definitions(migrations)?;
+    let applied = load_history(db);
+    verify_history(migrations, &applied)?;
+    let mut out = with_capacity<MigrationStatus>(migrations.size());
+    let mut i: usize = 0usize;
+    while i < migrations.size() {
+        let item = migrations.get(i);
+        out.push(migration_status(
+            item.version(),
+            item.name(),
+            item.checksum(),
+            find_applied(&applied, item.version()) >= 0
+        ));
+        i = i + 1usize;
+    }
+    return Result::Ok(out);
+}
+
+/// Return only migrations that are not recorded as applied.
+pub fn pending(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<Vec<MigrationStatus>, SimpleError> {
+    let all = status(db, migrations)?;
+    let mut out = with_capacity<MigrationStatus>(0);
+    let mut i: usize = 0usize;
+    while i < all.size() {
+        let item = all.get(i);
+        if !item.applied() {
+            out.push(migration_status(
+                item.version(),
+                item.name(),
+                item.checksum(),
+                false
+            ));
+        }
+        i = i + 1usize;
+    }
+    return Result::Ok(out);
+}
+
+/// Preview pending `up` statements without changing the database.
+pub fn dry_run(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    validate_definitions(migrations)?;
+    let applied = load_history(db);
+    verify_history(migrations, &applied)?;
+    let mut report = migration_report("up");
+    let mut i: usize = 0usize;
+    while i < migrations.size() {
+        let item = migrations.get(i);
+        if find_applied(&applied, item.version()) < 0 {
+            report.add_version(item.version());
+            report.add_sql(item.up_sql());
+        }
+        i = i + 1usize;
+    }
+    return Result::Ok(report);
+}
+
+/// Apply all pending migrations in ascending version order.
+pub fn up(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    validate_definitions(migrations)?;
+    create_history(db)?;
+    db.begin_immediate_transaction()?;
+    let applied = load_history(db);
+    match verify_history(migrations, &applied) {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {}
+    };
+    let mut report = migration_report("up");
+    let mut i: usize = 0usize;
+    while i < migrations.size() {
+        let item = migrations.get(i);
+        if find_applied(&applied, item.version()) < 0 {
+            match db.exec(item.up_sql()) {
+                Err(error) => {
+                    rollback(db);
+                    return Result::Err(error);
+                }
+                Ok(_) => {}
+            };
+            match record_applied(db, item, item.version()) {
+                Err(error) => {
+                    rollback(db);
+                    return Result::Err(error);
+                }
+                Ok(_) => {}
+            };
+            report.add_version(item.version());
+            report.add_sql(item.up_sql());
+        }
+        i = i + 1usize;
+    }
+    return finish_commit(db, report);
+}
+
+/// Roll back exactly one latest applied migration.
+pub fn down(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    validate_definitions(migrations)?;
+    create_history(db)?;
+    db.begin_immediate_transaction()?;
+    let applied = load_history(db);
+    match verify_history(migrations, &applied) {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {}
+    };
+    if applied.size() == 0usize {
+        rollback(db);
+        return Result::Err(migration_error(ERR_EMPTY, "no applied migration to roll back"));
+    }
+    let latest_version = last_version(&applied);
+    let idx = find_migration(migrations, latest_version);
+    if idx < 0 {
+        rollback(db);
+        return Result::Err(migration_error(
+            ERR_MISSING,
+            "latest applied migration is not embedded"
+        ));
+    }
+    let item = migrations.get(idx as usize);
+    match db.exec(item.down_sql()) {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {}
+    };
+    match delete_applied(db, latest_version) {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {}
+    };
+    let mut report = migration_report("down");
+    report.add_version(item.version());
+    report.add_sql(item.down_sql());
+    return finish_commit(db, report);
+}
+
+/// Roll back every applied migration in descending version order.
+pub fn reset(
+    db: &mut Db,
+    migrations: &Vec<Migration>
+) -> Result<MigrationReport, SimpleError> {
+    validate_definitions(migrations)?;
+    create_history(db)?;
+    db.begin_immediate_transaction()?;
+    let mut applied = load_history(db);
+    match verify_history(migrations, &applied) {
+        Err(error) => {
+            rollback(db);
+            return Result::Err(error);
+        }
+        Ok(_) => {}
+    };
+    let mut report = migration_report("reset");
+    while applied.size() > 0usize {
+        let latest_version = last_version(&applied);
+        let idx = find_migration(migrations, latest_version);
+        if idx < 0 {
+            rollback(db);
+            return Result::Err(migration_error(
+                ERR_MISSING,
+                "applied migration is not embedded"
+            ));
+        }
+        let item = migrations.get(idx as usize);
+        match db.exec(item.down_sql()) {
+            Err(error) => {
+                rollback(db);
+                return Result::Err(error);
+            }
+            Ok(_) => {}
+        };
+        match delete_applied(db, latest_version) {
+            Err(error) => {
+                rollback(db);
+                return Result::Err(error);
+            }
+            Ok(_) => {}
+        };
+        report.add_version(item.version());
+        report.add_sql(item.down_sql());
+        applied = load_history(db);
+    }
+    return finish_commit(db, report);
+}

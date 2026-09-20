@@ -1,0 +1,270 @@
+//! Explicit pool of reusable native SQLite database handles.
+
+mod std;
+
+import std::db::sqlite::Db;
+import std::drop::Drop;
+import std::error::SimpleError;
+import std::error::error_from_code;
+import std::error::simple_error_code;
+import std::error::kind::OTHER;
+import std::result::Result;
+import std::result::is_err;
+import std::result::is_ok;
+import std::str::clone;
+import std::time::instant_now;
+import std::time::instant_raw_nanos;
+import std::time::thread_sleep_ms;
+import std::vec::Vec;
+import std::vec::with_capacity;
+import app::db::pool::PoolMetrics;
+import app::db::pool::pool_metrics;
+import app::db::pool::resolve_pool_max;
+
+const ERR_POOL_EXHAUSTED: i32 = 2001;
+const ERR_POOL_CLOSED: i32 = 2002;
+const ERR_POOL_TIMEOUT: i32 = 2003;
+const ERR_POOL_DRAINING: i32 = 2004;
+
+pub struct DbLease {
+    db: Db,
+    active: bool,
+    healthy: bool,
+}
+
+fn pool_error(code: i32) -> SimpleError {
+    return error_from_code(OTHER, code);
+}
+
+/// A pool of caller-owned SQLite connections for one database path.
+pub struct SqlitePool {
+    path: string,
+    max: i32,
+    in_use: i32,
+    idle: Vec<Db>,
+    live: i32,
+    draining: bool,
+    acquisitions: i64,
+    timeouts: i64,
+    failures: i64,
+}
+
+/// Open a pool and eagerly create its first connection.
+pub fn pool_open(path: string, max: i32) -> Result<SqlitePool, SimpleError> {
+    let max_n = resolve_pool_max(max);
+    let db = std::db::sqlite::open(clone(path.as_str()))?;
+    let mut idle = with_capacity<Db>(max_n as usize);
+    idle.push(db);
+    return Result::Ok(SqlitePool {
+        path: path,
+        max: max_n,
+        in_use: 0,
+        idle: idle,
+        live: 1,
+        draining: false,
+        acquisitions: 0i64,
+        timeouts: 0i64,
+        failures: 0i64,
+    });
+}
+
+impl SqlitePool {
+    /// Acquire a connection, opening another lazily until the configured limit.
+    pub fn acquire(&mut self) -> Result<Db, SimpleError> {
+        if self.live == 0 || self.draining {
+            return Result::Err(pool_error(ERR_POOL_CLOSED));
+        }
+        let idle_n = self.idle.size();
+        if idle_n > 0usize {
+            let db = self.idle.remove(idle_n - 1usize);
+            if is_err(db.exec("SELECT 1")) {
+                self.live = self.live - 1;
+                match std::db::sqlite::open(clone(self.path.as_str())) {
+                    Err(error) => {
+                        self.failures = self.failures + 1i64;
+                        return Result::Err(error);
+                    }
+                    Ok(replacement) => {
+                        self.live = self.live + 1;
+                        self.in_use = self.in_use + 1;
+                        self.acquisitions = self.acquisitions + 1i64;
+                        return Result::Ok(replacement);
+                    }
+                };
+            }
+            self.in_use = self.in_use + 1;
+            self.acquisitions = self.acquisitions + 1i64;
+            return Result::Ok(db);
+        }
+
+        let total = self.in_use + idle_n as i32;
+        if total >= self.max {
+            return Result::Err(pool_error(ERR_POOL_EXHAUSTED));
+        }
+        let db = std::db::sqlite::open(clone(self.path.as_str()))?;
+        self.in_use = self.in_use + 1;
+        self.acquisitions = self.acquisitions + 1i64;
+        return Result::Ok(db);
+    }
+
+    /// Return a connection to the pool. The caller must return each handle once.
+    pub fn release(&mut self, db: Db) -> Result<(), SimpleError> {
+        if self.live == 0 {
+            return Result::Err(pool_error(ERR_POOL_CLOSED));
+        }
+        if self.in_use > 0 {
+            self.in_use = self.in_use - 1;
+        }
+        if self.draining {
+            self.live = self.live - 1;
+        } else if is_ok(db.exec("SELECT 1")) {
+            self.idle.push(db);
+        } else {
+            self.live = self.live - 1;
+            self.failures = self.failures + 1i64;
+        }
+        let ok: Result<(), SimpleError> = Result::Ok(());
+        return ok;
+    }
+
+    /// Acquire a health-checked lease, waiting up to `timeout_ms`.
+    pub fn acquire_lease(&mut self, timeout_ms: i32) -> Result<DbLease, SimpleError> {
+        if self.draining || self.live == 0 {
+            return Result::Err(pool_error(ERR_POOL_DRAINING));
+        }
+        let start = instant_raw_nanos(instant_now());
+        let timeout_ns = if timeout_ms > 0 { (timeout_ms as u64) * 1000000u64 } else { 0u64 };
+        let deadline = start + timeout_ns;
+        let mut done = false;
+        let mut result: Result<DbLease, SimpleError> =
+            Result::Err(pool_error(ERR_POOL_TIMEOUT));
+        while !done {
+            match self.acquire() {
+                Ok(db) => {
+                    result = Result::Ok(DbLease { db: db, active: true, healthy: true });
+                    done = true;
+                }
+                Err(error) => {
+                    if simple_error_code(&error) != ERR_POOL_EXHAUSTED {
+                        result = Result::Err(error);
+                        done = true;
+                    } else if timeout_ms <= 0 || instant_raw_nanos(instant_now()) >= deadline {
+                        self.timeouts = self.timeouts + 1i64;
+                        result = Result::Err(pool_error(ERR_POOL_TIMEOUT));
+                        done = true;
+                    } else {
+                        thread_sleep_ms(1u64);
+                    }
+                }
+            };
+        }
+        return result;
+    }
+
+    pub fn release_lease(&mut self, lease: DbLease) -> Result<(), SimpleError> {
+        if !lease.active {
+            return Result::Err(pool_error(ERR_POOL_CLOSED));
+        }
+        return self.release(lease.db);
+    }
+
+    pub fn acquire_with_timeout(&mut self, timeout_ms: i32) -> Result<DbLease, SimpleError> {
+        return self.acquire_lease(timeout_ms);
+    }
+
+    /// Drop idle connections and reject future acquires.
+    pub fn close(&mut self) -> Result<(), SimpleError> {
+        if self.live == 0 {
+            let ok: Result<(), SimpleError> = Result::Ok(());
+            return ok;
+        }
+        self.draining = true;
+        while self.idle.size() > 0usize {
+            let db = self.idle.remove(self.idle.size() - 1usize);
+            self.live = self.live - 1;
+        }
+        if self.in_use == 0 {
+            self.live = 0;
+        }
+        let ok: Result<(), SimpleError> = Result::Ok(());
+        return ok;
+    }
+
+    /// Stop new leases and wait for checked-out connections to return.
+    pub fn drain(&mut self, timeout_ms: i32) -> Result<(), SimpleError> {
+        if self.live == 0 {
+            return Result::Ok(());
+        }
+        self.draining = true;
+        let start = instant_raw_nanos(instant_now());
+        let deadline = start + if timeout_ms > 0 { (timeout_ms as u64) * 1000000u64 } else { 0u64 };
+        while self.in_use > 0 {
+            if timeout_ms <= 0 || instant_raw_nanos(instant_now()) >= deadline {
+                self.timeouts = self.timeouts + 1i64;
+                return Result::Err(pool_error(ERR_POOL_TIMEOUT));
+            }
+            thread_sleep_ms(1u64);
+        }
+        return self.close();
+    }
+
+    pub fn shutdown(&mut self, timeout_ms: i32) -> Result<(), SimpleError> {
+        return self.drain(timeout_ms);
+    }
+
+    pub fn metrics(&self) -> PoolMetrics {
+        return pool_metrics(
+            self.live,
+            self.idle.size() as i32,
+            self.in_use,
+            self.acquisitions,
+            self.timeouts,
+            self.failures
+        );
+    }
+
+    pub fn max_size(&self) -> i32 {
+        return self.max;
+    }
+
+    pub fn idle_count(&self) -> usize {
+        return self.idle.size();
+    }
+
+    pub fn in_use_count(&self) -> i32 {
+        return self.in_use;
+    }
+}
+
+impl DbLease {
+    pub fn is_active(&self) -> bool { return self.active; }
+    pub fn is_healthy(&self) -> bool { return self.active && self.healthy; }
+
+    pub fn ping(&mut self) -> Result<(), SimpleError> {
+        match self.db.exec("SELECT 1") {
+            Err(error) => {
+                self.healthy = false;
+                return Result::Err(error);
+            }
+            Ok(_) => {
+                self.healthy = true;
+                return Result::Ok(());
+            }
+        };
+    }
+
+    pub fn context(&self) -> &Db {
+        return &self.db;
+    }
+
+    pub fn take(&mut self) -> Db {
+        self.active = false;
+        return self.db;
+    }
+}
+
+impl Drop for SqlitePool {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}

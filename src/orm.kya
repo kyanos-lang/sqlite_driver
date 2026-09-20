@@ -1,0 +1,44 @@
+//! Compile-time SQLite model metadata and CRUD SQL templates.
+//!
+//! The `orm::model_*_sql<T>()` calls are compiler intrinsics.  They expand
+//! from the annotated model declaration, so table and column names never come
+//! from runtime input.  Values remain parameters in the existing query builder.
+
+/// Return the table selected by `#[orm(table = "...")]`.
+pub fn model_table<T>() -> string {
+    return "";
+}
+
+/// Return the primary-key column selected by `#[orm(primary_key)]`.
+pub fn model_primary_key<T>() -> string {
+    return "";
+}
+
+/// Return a parameterized INSERT statement for `T`.
+pub fn model_insert_sql<T>() -> string {
+    return "";
+}
+
+/// Return a parameterized INSERT ... ON CONFLICT upsert statement for `T`.
+pub fn model_upsert_sql<T>() -> string {
+    return "";
+}
+
+pub fn model_ignore_sql<T>() -> string {
+    return "";
+}
+
+/// Return a parameterized SELECT-by-primary-key statement for `T`.
+pub fn model_find_sql<T>() -> string {
+    return "";
+}
+
+/// Return a parameterized UPDATE-by-primary-key statement for `T`.
+pub fn model_update_sql<T>() -> string {
+    return "";
+}
+
+/// Return a parameterized DELETE-by-primary-key statement for `T`.
+pub fn model_delete_sql<T>() -> string {
+    return "";
+}

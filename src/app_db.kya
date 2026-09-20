@@ -1,0 +1,56 @@
+//! SQLite callbacks for the neutral `app::db` lifecycle contract.
+//!
+//! This module does not depend on `app`; applications wire these callbacks
+//! into `app::db_backend` explicitly. Query builders and row APIs remain in
+//! this package.
+
+mod std;
+
+import std::db::sqlite::Db;
+
+extern "C" fn kyanos_sqlite_close(db: i32);
+extern "C" fn kyanos_sqlite_exec(db: i32, sql: string) -> i32;
+
+pub fn app_db_driver_name() -> string {
+    return "sqlite";
+}
+
+pub fn app_db_driver_version() -> string {
+    return "3";
+}
+
+pub fn app_db_handle(db: &Db) -> i32 {
+    return db.raw_handle();
+}
+
+pub fn app_db_take_handle(db: &mut Db) -> i32 {
+    return db.take_handle();
+}
+
+pub fn app_db_ping(handle: i32) -> i32 {
+    return kyanos_sqlite_exec(handle, "SELECT 1");
+}
+
+pub fn app_db_begin(handle: i32) -> i32 {
+    return kyanos_sqlite_exec(handle, "BEGIN");
+}
+
+pub fn app_db_commit(handle: i32) -> i32 {
+    return kyanos_sqlite_exec(handle, "COMMIT");
+}
+
+pub fn app_db_rollback(handle: i32) -> i32 {
+    return kyanos_sqlite_exec(handle, "ROLLBACK");
+}
+
+pub fn app_db_close(handle: i32) -> i32 {
+    if handle != 0 {
+        kyanos_sqlite_close(handle);
+    }
+    return 0;
+}
+
+/// Apply a driver-specific SQL migration/seed statement.
+pub fn app_db_exec(handle: i32, sql: string) -> i32 {
+    return kyanos_sqlite_exec(handle, sql);
+}

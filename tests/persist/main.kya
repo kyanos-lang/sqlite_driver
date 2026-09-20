@@ -1,0 +1,149 @@
+//! Library-consumer persist shape: `mod sqlite` verbs plus a local round-trip.
+
+mod std;
+mod app;
+mod sqlite;
+
+import sqlite::bind_values;
+import sqlite::BindValues;
+import sqlite::model_delete;
+import sqlite::model_delete_sql;
+import sqlite::model_find;
+import sqlite::model_find_sql;
+import sqlite::model_insert;
+import sqlite::model_insert_sql;
+import sqlite::model_update;
+import sqlite::model_update_sql;
+import sqlite::model_upsert;
+import sqlite::model_upsert_sql;
+import sqlite::open;
+import sqlite::RowValues;
+import std::db::sqlite::Db;
+import std::io::println;
+import std::process::exit;
+import std::str::clone;
+
+#[orm(table = "people")]
+struct Person {
+    #[orm(primary_key)]
+    id: i32,
+    name: string,
+}
+
+fn fail(message: string) {
+    println(message);
+    exit(1);
+}
+
+fn persist_bind_write(model: &Person) -> BindValues {
+    let mut values = bind_values();
+    values.push_i32(model.id);
+    values.push_text(clone(model.name.as_str()));
+    return values;
+}
+
+fn persist_bind_update(model: &Person) -> BindValues {
+    let mut values = bind_values();
+    values.push_text(clone(model.name.as_str()));
+    values.push_i32(model.id);
+    return values;
+}
+
+fn persist_read(row: &RowValues) -> Person {
+    return Person {
+        id: row.column_i32(0),
+        name: row.column_text(1),
+    };
+}
+
+fn persist_round_trip(db: &Db) -> bool {
+    if db.exec("DROP TABLE IF EXISTS people;").is_err()
+        || db.exec("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT);").is_err() {
+        println("persist fail: schema");
+        return false;
+    }
+    let ada = Person {
+        id: 7,
+        name: "Ada",
+    };
+    if model_insert<Person>(db, persist_bind_write(&ada)).is_err() {
+        println("persist fail: insert");
+        return false;
+    }
+    match model_find<Person>(db, 7) {
+        Err(_) => {
+            println("persist fail: find err");
+            return false;
+        }
+        Ok(found) => {
+            match found {
+                None => {
+                    println("persist fail: find none");
+                    return false;
+                }
+                Some(row) => {
+                    let person = persist_read(&row);
+                    if person.name != "Ada" {
+                        println("persist fail: name");
+                        return false;
+                    }
+                }
+            };
+        }
+    };
+    let grace = Person {
+        id: 7,
+        name: "Grace",
+    };
+    if model_update<Person>(db, persist_bind_update(&grace)).is_err() {
+        println("persist fail: update");
+        return false;
+    }
+    if model_upsert<Person>(db, persist_bind_write(&grace)).is_err() {
+        println("persist fail: upsert");
+        return false;
+    }
+    if model_delete<Person>(db, 7).is_err() {
+        println("persist fail: delete");
+        return false;
+    }
+    match model_find<Person>(db, 7) {
+        Err(_) => {
+            println("persist fail: find after delete");
+            return false;
+        }
+        Ok(found) => {
+            match found {
+                None => {
+                    return true;
+                }
+                Some(_) => {
+                    println("persist fail: row remained");
+                    return false;
+                }
+            };
+        }
+    };
+}
+
+fn main() {
+    if model_insert_sql<Person>() != "INSERT INTO people (id, name) VALUES (?, ?)"
+        || model_update_sql<Person>() != "UPDATE people SET name = ? WHERE id = ?"
+        || model_find_sql<Person>() != "SELECT id, name FROM people WHERE id = ? LIMIT 1"
+        || model_delete_sql<Person>() != "DELETE FROM people WHERE id = ?"
+        || model_upsert_sql<Person>()
+            != "INSERT INTO people (id, name) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name" {
+        fail("sqlite persist SQL generation failed");
+    }
+    match open("/tmp/kyanos_sqlite_persist.db") {
+        Err(_) => {
+            fail("sqlite persist: open failed");
+        }
+        Ok(opened) => {
+            if !persist_round_trip(&opened) {
+                fail("sqlite persist: model round-trip failed");
+            }
+        }
+    };
+    println("sqlite_persist_ok");
+}

@@ -1,0 +1,32 @@
+//! Result-scoped SQLite transactions.
+
+mod std;
+
+import app::db::txn::with_transaction as run_transaction;
+import std::db::sqlite::Db;
+import std::error::SimpleError;
+import std::result::Result;
+
+fn begin_tx(db: &mut Db) -> Result<(), SimpleError> {
+    return db.begin_transaction();
+}
+
+fn commit_tx(db: &mut Db) -> Result<(), SimpleError> {
+    return db.commit_transaction();
+}
+
+fn rollback_tx(db: &mut Db) -> Result<(), SimpleError> {
+    return db.rollback_transaction();
+}
+
+/// Run `body` inside a transaction.
+///
+/// A successful body is committed. Any body or commit error rolls back. The
+/// database remains owned by the caller, and no transaction state is attached
+/// to an app request or process-global handle.
+pub fn with_transaction<T>(
+    db: &mut Db,
+    body: fn(&mut Db) -> Result<T, SimpleError>
+) -> Result<T, SimpleError> {
+    return run_transaction(db, begin_tx, commit_tx, rollback_tx, body);
+}

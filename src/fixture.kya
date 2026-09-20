@@ -1,0 +1,50 @@
+//! Deterministic SQLite fixture and seed helpers.
+
+mod std;
+
+import std::db::sqlite::Db;
+import std::error::SimpleError;
+import std::result::Result;
+import std::str::clone;
+import std::vec::Vec;
+
+fn apply_statements(db: &Db, statements: &Vec<string>) -> Result<(), SimpleError> {
+    let mut i: usize = 0usize;
+    while i < statements.size() {
+        let sql = clone(statements.get(i).as_str());
+        db.exec(sql)?;
+        i = i + 1usize;
+    }
+    let ok: Result<(), SimpleError> = Result::Ok(());
+    return ok;
+}
+
+/// Apply ordered schema or seed statements to an existing database.
+pub fn apply(db: &Db, statements: &Vec<string>) -> Result<(), SimpleError> {
+    return apply_statements(db, statements);
+}
+
+/// Apply ordered teardown statements to reset a fixture database.
+pub fn reset(db: &Db, statements: &Vec<string>) -> Result<(), SimpleError> {
+    return apply_statements(db, statements);
+}
+
+/// Open a database and apply schema statements followed by seed statements.
+pub fn open_fixture(
+    path: string,
+    schema: Vec<string>,
+    seeds: Vec<string>
+) -> Result<Db, SimpleError> {
+    let db = std::db::sqlite::open(path)?;
+    apply_statements(&db, &schema)?;
+    apply_statements(&db, &seeds)?;
+    return Result::Ok(db);
+}
+
+/// Open an isolated in-memory fixture database.
+pub fn open_memory_fixture(
+    schema: Vec<string>,
+    seeds: Vec<string>
+) -> Result<Db, SimpleError> {
+    return open_fixture(":memory:", schema, seeds);
+}

@@ -1,0 +1,8 @@
+[package]
+name = "sqlite_smoke"
+version = "0.1.0"
+entry = "../src/smoke.kya"
+kyanos = "1.0.86"
+
+[dependencies.app]
+path = "../../../kyanos_app"
